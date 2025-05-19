@@ -43,11 +43,12 @@ project_build_tag!(BUILD_TAG);
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Debug, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
 enum AuthBackendType {
-    #[value(name("cplane-v1"), alias("control-plane"))]
-    ControlPlaneV1,
+    #[clap(alias("cplane-v1"))]
+    ControlPlane,
 
-    #[value(name("link"), alias("control-redirect"))]
+    #[clap(alias("link"))]
     ConsoleRedirect,
 
     #[cfg(any(test, feature = "testing"))]
@@ -160,8 +161,11 @@ struct ProxyCliArgs {
     #[clap(long, default_values_t = RateBucketInfo::DEFAULT_REDIS_SET)]
     redis_rps_limit: Vec<RateBucketInfo>,
     /// Cancellation channel size (max queue size for redis kv client)
-    #[clap(long, default_value = "1024")]
+    #[clap(long, default_value_t = 1024)]
     cancellation_ch_size: usize,
+    /// Cancellation ops batch size for redis
+    #[clap(long, default_value_t = 8)]
+    cancellation_batch_size: usize,
     /// cache for `allowed_ips` (use `size=0` to disable)
     #[clap(long, default_value = config::CacheOptions::CACHE_DEFAULT_OPTIONS)]
     allowed_ips_cache: String,
@@ -541,7 +545,12 @@ pub async fn run() -> anyhow::Result<()> {
             if let Some(mut redis_kv_client) = redis_kv_client {
                 maintenance_tasks.spawn(async move {
                     redis_kv_client.try_connect().await?;
-                    handle_cancel_messages(&mut redis_kv_client, rx_cancel).await?;
+                    handle_cancel_messages(
+                        &mut redis_kv_client,
+                        rx_cancel,
+                        args.cancellation_batch_size,
+                    )
+                    .await?;
 
                     drop(redis_kv_client);
 
@@ -707,7 +716,7 @@ fn build_auth_backend(
     args: &ProxyCliArgs,
 ) -> anyhow::Result<Either<&'static auth::Backend<'static, ()>, &'static ConsoleRedirectBackend>> {
     match &args.auth_backend {
-        AuthBackendType::ControlPlaneV1 => {
+        AuthBackendType::ControlPlane => {
             let wake_compute_cache_config: CacheOptions = args.wake_compute_cache.parse()?;
             let project_info_cache_config: ProjectInfoCacheOptions =
                 args.project_info_cache.parse()?;
@@ -862,7 +871,7 @@ async fn configure_redis(
         ("irsa", _) => match (&args.redis_host, args.redis_port) {
             (Some(host), Some(port)) => Some(
                 ConnectionWithCredentialsProvider::new_with_credentials_provider(
-                    host.to_string(),
+                    host.clone(),
                     port,
                     elasticache::CredentialsProvider::new(
                         args.aws_region.clone(),
